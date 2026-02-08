@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# 流量消耗/循环测速脚本 v3.0 (仪表盘版)
+# 流量消耗/循环测速脚本 v4.0 (多节点轮询版)
 # ==================================================
 
 # 颜色定义
@@ -38,57 +38,78 @@ display_status() {
     TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MB/1024}")
     
     echo -e "${BLUE}#################################################${NC}"
-    echo -e "${BLUE}#            流量消耗挂机脚本 v3.0              #${NC}"
+    echo -e "${BLUE}#            流量消耗挂机脚本 v4.0              #${NC}"
     echo -e "${BLUE}#################################################${NC}"
     echo -e ""
     echo -e "   🚀 ${GREEN}当前模式:${NC} $1"
     echo -e "   📊 ${YELLOW}已消耗总流量:${NC} ${RED}${TOTAL_GB} GB${NC}"
-    echo -e "   ⏱️  ${SKYBLUE}运行状态:${NC} 正在运行中 (按 Ctrl+C 停止)"
+    echo -e "   ⏱️  ${SKYBLUE}运行状态:${NC} 正在运行中..."
     echo -e ""
     echo -e "${BLUE}-------------------------------------------------${NC}"
-    echo -e "正在执行下一轮任务..."
 }
 
-# 1. 如下行 (循环下载)
+# 定义下载节点库 (精选全球大带宽测速源)
+# 格式：URL|文件大小(MB)
+NODES=(
+    "http://mirror.leaseweb.com/speedtest/1000mb.bin|1000"     # Leaseweb (通常最快)
+    "http://speedtest.tele2.net/1GB.zip|1024"                 # Tele2 (欧洲老牌)
+    "http://ipv4.download.thinkbroadband.com/1GB.zip|1024"    # ThinkBroadband
+    "http://speedtest-nyc1.digitalocean.com/5gb.test|5120"    # DigitalOcean (美国)
+    "http://speedtest.london.linode.com/100MB-london.bin|100" # Linode (英国)
+    "http://speedtest.tokyo2.linode.com/100MB-tokyo2.bin|100" # Linode (日本)
+    "https://fsn1-speed.hetzner.com/1GB.bin|1000"             # Hetzner (德国)
+    "http://speedtest.fremont.linode.com/100MB-fremont.bin|100" # Linode (美西)
+)
+
+# 随机获取一个节点
+get_random_node() {
+    RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
+    NODE_INFO="${NODES[$RANDOM_INDEX]}"
+    NODE_URL="${NODE_INFO%%|*}"
+    NODE_SIZE="${NODE_INFO##*|}"
+}
+
+# 1. 如下行 (随机节点循环)
 run_download() {
-    # 使用 512MB 的文件，既能跑满带宽，又能比较快地刷新“已消耗流量”的统计
-    # 备选源列表
-    URL1="http://speedtest.tele2.net/512MB.zip"
-    URL2="http://ping.online.net/500Mo.dat"
-    
-    SIZE_MB=512
-    
     while true; do
         display_status "只跑下行 (Download)"
+        get_random_node
         
-        # 尝试使用 URL1
-        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "$URL1"
+        echo -e "正在连接节点: ${SKYBLUE}$NODE_URL${NC}"
+        echo -e "文件大小预计: ${YELLOW}$NODE_SIZE MB${NC}"
+        
+        # 核心下载命令
+        # --timeout=10: 超时时间10秒，防止卡死
+        # --tries=2: 失败重试2次
+        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress --timeout=10 --tries=2 "$NODE_URL"
+        
+        # 检查 wget 退出状态
         if [ $? -eq 0 ]; then
-            TOTAL_MB=$((TOTAL_MB + SIZE_MB))
+            TOTAL_MB=$((TOTAL_MB + NODE_SIZE))
+            echo -e "${GREEN}下载完成，流量已记录。${NC}"
         else
-            echo -e "${RED}[!] 节点1连接失败，切换备用节点...${NC}"
-            wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "$URL2"
-            if [ $? -eq 0 ]; then
-                TOTAL_MB=$((TOTAL_MB + 500))
-            else
-                echo -e "${RED}[!] 所有节点均超时，等待 5 秒重试...${NC}"
-                sleep 5
-            fi
+            echo -e "${RED}[!] 当前节点连接失败或超时，自动切换下一个...${NC}"
+            sleep 2
         fi
+        
+        sleep 1
     done
 }
 
-# 2. 跑上行 (Speedtest Upload)
+# 2. 跑上行
 run_upload() {
     while true; do
         display_status "只跑上行 (Upload)"
-        echo -e "${YELLOW}正在测速上传 (不下载)...${NC}"
-        # speedtest 比较难精确统计流量，按一次大概 50-100MB 估算，或者只显示次数
+        echo -e "${YELLOW}正在执行 Speedtest 上传测试...${NC}"
         speedtest-cli --no-download --secure
-        echo -e "\n${GREEN}完成一轮上传，休息 2 秒...${NC}"
+        if [ $? -eq 0 ]; then
+            echo -e "\n${GREEN}上传测试完成${NC}"
+            # 估算每次上传消耗 60MB (视带宽而定，仅做参考)
+            TOTAL_MB=$((TOTAL_MB + 60))
+        else
+            echo -e "${RED}[!] Speedtest 连接失败，重试中...${NC}"
+        fi
         sleep 2
-        # 简单估算增加统计 (仅作参考)
-        TOTAL_MB=$((TOTAL_MB + 50)) 
     done
 }
 
@@ -97,15 +118,18 @@ run_both() {
     while true; do
         display_status "混合双打 (Down+Up)"
         
-        echo -e "${SKYBLUE}[1/2] 正在下载...${NC}"
-        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "http://speedtest.tele2.net/100MB.zip"
-        TOTAL_MB=$((TOTAL_MB + 100))
+        # 下载部分
+        get_random_node
+        echo -e "${SKYBLUE}[1/2] 正在下载 (${NODE_SIZE}MB)...${NC}"
+        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress --timeout=10 --tries=1 "$NODE_URL"
+        if [ $? -eq 0 ]; then TOTAL_MB=$((TOTAL_MB + NODE_SIZE)); fi
         
+        # 上传部分
         echo -e "\n${SKYBLUE}[2/2] 正在上传...${NC}"
         speedtest-cli --secure
-        TOTAL_MB=$((TOTAL_MB + 50))
+        TOTAL_MB=$((TOTAL_MB + 60))
         
-        sleep 2
+        sleep 3
     done
 }
 
@@ -114,13 +138,14 @@ main() {
     check_dep
     clear
     echo -e "=================================="
-    echo -e "   流量消耗脚本 (带统计面板)"
+    echo -e "   流量消耗挂机脚本 v4.0 (Pro)"
     echo -e "=================================="
-    echo -e "1. ${GREEN}只跑下行${NC} (推荐，显示进度条)"
-    echo -e "2. ${GREEN}只跑上行${NC} (使用 Speedtest)"
+    echo -e "1. ${GREEN}只跑下行${NC} (推荐, 多节点随机轮询)"
+    echo -e "2. ${GREEN}只跑上行${NC} (Speedtest)"
     echo -e "3. ${GREEN}混合循环${NC}"
     echo -e "0. 退出"
-    read -p "请选择: " choice
+    echo -e "=================================="
+    read -p "请选择 [1-3]: " choice
 
     case $choice in
         1) run_download ;;

@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# ==========================================
+# 流量消耗/循环测速脚本 - One Click Version
+# ==========================================
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# 检查是否以 Root 运行
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}错误：请使用 sudo 或 root 用户运行此脚本！${NC}" 
+   exit 1
+fi
+
+# 捕获 Ctrl+C
+trap 'echo -e "\n${RED}[!] 用户终止脚本。${NC}"; exit 1' INT
+
+# 自动安装依赖函数
+install_dependencies() {
+    echo -e "${BLUE}[*] 正在检查并安装必要组件 (wget, speedtest-cli, python3)...${NC}"
+    
+    # 检测系统包管理器
+    if [ -f /etc/debian_version ]; then
+        PM="apt-get"
+        $PM update -y -q
+        $PM install -y -q wget python3 python3-pip
+    elif [ -f /etc/redhat-release ]; then
+        PM="yum"
+        $PM install -y -q wget python3 python3-pip
+    else
+        echo -e "${RED}[!] 不支持的系统，请手动安装 wget 和 speedtest-cli${NC}"
+        exit 1
+    fi
+
+    # 安装 speedtest-cli (优先使用 pip，版本更新)
+    if ! command -v speedtest-cli &> /dev/null; then
+        echo -e "${YELLOW}[-] 正在通过 pip 安装 speedtest-cli...${NC}"
+        pip3 install speedtest-cli
+    fi
+    echo -e "${GREEN}[+] 环境准备就绪。${NC}"
+}
+
+# 1. 跑路下行 (消耗最快)
+run_download() {
+    echo -e "${GREEN}=== 模式：无限下行 (Wget -> /dev/null) ===${NC}"
+    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
+    count=1
+    while true; do
+        echo -e "\n${BLUE}---> 第 $count 次下载...${NC}"
+        # 这里的链接选择了 Cloudflare 全球 CDN，速度通常很快
+        wget -O /dev/null "https://speed.cloudflare.com/__down?bytes=1000000000" --report-speed=bits
+        ((count++))
+    done
+}
+
+# 2. 跑路上行
+run_upload() {
+    echo -e "${GREEN}=== 模式：无限上行 (Speedtest Upload Only) ===${NC}"
+    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
+    count=1
+    while true; do
+        echo -e "\n${BLUE}---> 第 $count 次上传...${NC}"
+        speedtest-cli --no-download --secure
+        ((count++))
+        sleep 1
+    done
+}
+
+# 3. 双向消耗
+run_both() {
+    echo -e "${GREEN}=== 模式：双向循环 ===${NC}"
+    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
+    count=1
+    while true; do
+        echo -e "\n${BLUE}---> 第 $count 次双向测试...${NC}"
+        speedtest-cli --secure
+        ((count++))
+        sleep 1
+    done
+}
+
+# 菜单
+main_menu() {
+    clear
+    install_dependencies
+    echo -e "======================================"
+    echo -e "    ${YELLOW}流量消耗一键脚本 v2.0${NC}"
+    echo -e "======================================"
+    echo -e "1. ${GREEN}只跑下行${NC} (最高效，不占硬盘)"
+    echo -e "2. ${GREEN}只跑上行${NC} (模拟上传)"
+    echo -e "3. ${GREEN}混合双打${NC} (先下后上)"
+    echo -e "0. 退出"
+    echo -e "======================================"
+    read -p "请输入选项 [1-3]: " choice
+
+    case $choice in
+        1) run_download ;;
+        2) run_upload ;;
+        3) run_both ;;
+        0) exit 0 ;;
+        *) echo "无效输入"; sleep 1; main_menu ;;
+    esac
+}
+
+main_menu

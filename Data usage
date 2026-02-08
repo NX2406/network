@@ -1,104 +1,146 @@
 #!/bin/bash
 
 # ==================================================
-# 流量消耗脚本 v10.0 (DNS暴力修复 + 多进程并发版)
+# 流量消耗/测速脚本 v12.0 (实时统计 + 进度条美化版)
 # ==================================================
 
-# 颜色
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 累计流量 (估算)
-TOTAL_GB=0
-# 并发进程数 (等于多线程)
-CONCURRENT_NUM=4
+# 全局变量
+URL="https://fsn1-speed.hetzner.com/10GB.bin" # 10GB 文件
+START_TIME=$(date +%s)
+TOTAL_BYTES=0
+CURRENT_THREADS=0
 
-# 捕获 Ctrl+C，杀掉所有后台下载进程
-trap 'echo -e "\n${RED}[!] 停止脚本，正在清理后台进程...${NC}"; kill $(jobs -p) 2>/dev/null; exit 1' INT
+# 捕获 Ctrl+C
+trap 'cleanup' INT
 
-# ====================
-# 1. 暴力修复 DNS (核心修复)
-# ====================
-fix_dns() {
-    echo -e "${YELLOW}[*] 检测到可能的 DNS 故障，正在强制修复 DNS...${NC}"
-    # 备份原文件
-    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
-    # 写入 Google DNS
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+cleanup() {
+    echo -e "\n${RED}[!] 正在停止所有任务...${NC}"
+    kill $(jobs -p) 2>/dev/null
+    rm -f wget-log* 2>/dev/null
     
-    # 测试一下能不能通
-    ping -c 1 -W 1 google.com > /dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}[+] DNS 修复成功，网络已通！${NC}"
-    else
-        echo -e "${RED}[!] DNS 修复失败，您的服务器可能被防火墙完全阻断！${NC}"
-    fi
+    END_TIME=$(date +%s)
+    DURATION=$((END_TIME - START_TIME))
+    # 转换流量单位
+    TOTAL_GB=$(echo "scale=2; $TOTAL_BYTES / 1024 / 1024 / 1024" | bc 2>/dev/null)
+    if [ -z "$TOTAL_GB" ]; then TOTAL_GB="计算中"; fi
+
+    echo -e "${GREEN}==========================================${NC}"
+    echo -e "   🏁 运行结束"
+    echo -e "   ⏱️  总运行时长: ${YELLOW}${DURATION} 秒${NC}"
+    echo -e "   📊 本次消耗估算: ${CYAN}${TOTAL_GB} GB${NC} (理论值)"
+    echo -e "${GREEN}==========================================${NC}"
+    exit 0
 }
 
+# 1. 依赖检查与安装 (bc用于浮点运算)
 check_dep() {
     if ! command -v wget &> /dev/null; then
-        apt-get install -y wget || yum install -y wget
+        echo -e "${YELLOW}安装 wget...${NC}"; apt-get install -y wget || yum install -y wget
+    fi
+    if ! command -v bc &> /dev/null; then
+        echo -e "${YELLOW}安装 bc (计算工具)...${NC}"; apt-get install -y bc || yum install -y bc
     fi
 }
 
-# ====================
-# 2. 运行逻辑 (多进程 Wget)
-# ====================
-run_traffic() {
-    # 使用 Hetzner 官方测速源 (10GB文件)，最稳，不封 IP
-    URL="https://fsn1-speed.hetzner.com/10GB.bin"
+# 2. 暴力修复 DNS
+fix_dns() {
+    echo -e "${YELLOW}[*] 正在优化网络配置...${NC}"
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+}
+
+# 3. 动态仪表盘
+show_dashboard() {
+    clear
+    NOW_TIME=$(date +%s)
+    RUN_TIME=$((NOW_TIME - START_TIME))
     
-    echo -e "${BLUE}==============================================${NC}"
-    echo -e "   正在启动 ${GREEN}${CONCURRENT_NUM}${NC} 个并发进程进行消耗..."
-    echo -e "   使用节点: Hetzner (德国)"
-    echo -e "   ${YELLOW}注意：不再显示进度条，直接看流量统计${NC}"
-    echo -e "${BLUE}==============================================${NC}"
+    # 估算流量：每个线程跑完一次是 10GB
+    # 这里我们只记录大概的循环次数来估算，或者直接显示实时状态
+    
+    echo -e "${BLUE}#################################################${NC}"
+    echo -e "${BLUE}#        流量消耗挂机脚本 v12.0 (Pro)           #${NC}"
+    echo -e "${BLUE}#################################################${NC}"
+    echo -e ""
+    echo -e "   🚀 ${GREEN}目标文件:${NC} Hetzner 10GB Speedtest File"
+    echo -e "   ⚡ ${GREEN}并发线程:${NC} ${CYAN}${CURRENT_THREADS}${NC}"
+    echo -e "   ⏱️  ${GREEN}运行时间:${NC} ${YELLOW}${RUN_TIME} 秒${NC}"
+    echo -e ""
+    echo -e "${BLUE}-------------------------------------------------${NC}"
+    echo -e "${PURPLE}正在全速下载中，请看下方进度条...${NC}"
+    echo -e "${BLUE}-------------------------------------------------${NC}"
+}
+
+# 4. 核心下载逻辑 (带进度条)
+run_traffic() {
+    local threads=$1
+    CURRENT_THREADS=$threads
+    
+    # 首次展示面板
+    show_dashboard
 
     while true; do
-        # 启动多进程后台下载
-        for ((i=1; i<=CONCURRENT_NUM; i++)); do
-            # -O /dev/null: 不占硬盘
-            # -q: 静默模式
-            # --timeout: 超时保护
+        # 启动 N-1 个后台静默进程 (作为负载)
+        for ((i=1; i<threads; i++)); do
             wget -O /dev/null -q --timeout=10 --tries=2 "$URL" &
         done
-
-        # 等待这一批全部跑完 (或超时)
+        
+        # 启动 1 个前台进程 (显示进度条)
+        # --progress=bar:force 强制显示进度条
+        # 2>&1 | grep ... : 这里为了不破坏仪表盘，我们直接让 wget 输出在下方
+        
+        echo -e "${CYAN}>> 主线程进度 (其余 ${threads} 个线程在后台狂奔):${NC}"
+        wget -O /dev/null --progress=bar:force "$URL" 
+        
+        # 所有的都跑完一轮后
         wait
         
-        # 统计流量 (粗略计算：4个进程 x 10GB = 40GB，但为了准确通常跑不满就会断，这里按时间估算或仅仅是为了跑流量)
-        # 这里为了不误导，我们直接无限循环，不依赖文件大小统计
-        echo -e "${GREEN} >> 完成一轮并发消耗 (约消耗带宽满载运行)...${NC}"
+        # 统计流量 (粗略计算：线程数 * 10GB)
+        # 注意：bash不支持大数浮点运算，这里仅做累加标记
+        # 实际上 10GB * 线程数 很大，这里简单处理
+        ADD_BYTES=$(echo "$threads * 10737418240" | bc)
+        TOTAL_BYTES=$(echo "$TOTAL_BYTES + $ADD_BYTES" | bc)
         
-        # 简单防卡死
+        show_dashboard
+        echo -e "${GREEN} >> 完成一轮 ${threads}0GB 流量消耗，休息 1 秒继续...${NC}"
         sleep 1
     done
 }
 
-# ====================
-# 3. 入口
-# ====================
+# 5. 主菜单
 main() {
-    clear
-    # 必须以 Root 运行
-    if [[ $EUID -ne 0 ]]; then
-       echo -e "${RED}必须使用 root 运行！${NC}"; exit 1
-    fi
-
     check_dep
-    fix_dns # 先修 DNS
-    
-    echo -e "1. ${GREEN}开始跑流量${NC} (DNS修复 + 4倍速并发)"
+    fix_dns
+    clear
+    echo -e "================================================="
+    echo -e "    流量消耗脚本 v12.0 (界面美化版)"
+    echo -e "================================================="
+    echo -e "1. ${GREEN}启动标准模式${NC} (默认 10 线程，稳定)"
+    echo -e "2. ${GREEN}启动狂暴模式${NC} (自定义线程数)"
     echo -e "0. 退出"
-    read -p "回车直接开始: " choice
+    echo -e "================================================="
+    read -p "请选择 [1-2]: " choice
 
     case $choice in
+        1) 
+            run_traffic 10 
+            ;;
+        2) 
+            read -p "请输入并发线程数 (建议 5-50): " t
+            if [[ ! "$t" =~ ^[0-9]+$ ]]; then t=10; fi
+            run_traffic $t
+            ;;
         0) exit 0 ;;
-        *) run_traffic ;;
+        *) run_traffic 10 ;;
     esac
 }
 

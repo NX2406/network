@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# 流量消耗/循环测速脚本 v7.0 (防死循环修复版)
+# 流量消耗/测速脚本 v8.0 (死循环终极修复版)
 # ==================================================
 
 # 颜色定义
@@ -10,23 +10,21 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 SKYBLUE='\033[0;36m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 NC='\033[0m'
 
-# 线程数
+# 线程数 (默认8，过大容易被断开)
 THREADS=8
 # 累计消耗流量 (MB)
 TOTAL_MB=0
-# 连续失败计数器
-FAIL_COUNT=0
 
 # 捕获 Ctrl+C
-trap 'echo -e "\n${RED}[!] 脚本已停止。本次运行共消耗流量：$(awk "BEGIN {print $TOTAL_MB/1024}") GB${NC}"; exit 1' INT
+trap 'echo -e "\n${RED}[!] 脚本已停止。本次运行共消耗流量：$(awk "BEGIN {print $TOTAL_MB/1024}") GB${NC}"; rm -f *.st; exit 1' INT
 
 # ====================
 # 1. 基础依赖检查
 # ====================
 check_dep() {
+    # 检查/安装 axel
     if ! command -v axel &> /dev/null; then
         echo -e "${YELLOW}正在安装 axel...${NC}"
         if [ -f /etc/debian_version ]; then 
@@ -35,205 +33,165 @@ check_dep() {
             yum install -y epel-release && yum install -y axel
         fi
     fi
+    # 检查/安装 speedtest
     if ! command -v speedtest-cli &> /dev/null; then
         echo -e "${YELLOW}正在安装 speedtest-cli...${NC}"
         pip3 install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null || yum install -y speedtest-cli 2>/dev/null
     fi
+    # 检查 curl
     if ! command -v curl &> /dev/null; then apt-get install -y curl; fi
 }
 
-get_ip_info() {
-    IP_INFO=$(curl -s --max-time 5 http://ip-api.com/line/?fields=query,country,city,isp)
-    MY_IP=$(echo "$IP_INFO" | sed -n '1p')
-    MY_COUNTRY=$(echo "$IP_INFO" | sed -n '2p')
-    MY_CITY=$(echo "$IP_INFO" | sed -n '3p')
-}
-
 # ====================
-# 2. 节点库 (移除易封锁/失效节点)
+# 2. 高质量节点库 (精简为必活节点)
 # ====================
-# 格式: 区域|名称|URL|大小(MB)
+# 格式: 地区|名称|URL|大小(MB)
+# 只保留大厂官方 Looking Glass，剔除易变节点
 NODES=(
-    "Global|Linux Kernel CDN|https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.1.tar.xz|100"
-    "APAC|🇯🇵 日本 (Linode)|http://speedtest.tokyo2.linode.com/100MB-tokyo2.bin|100"
-    "APAC|🇸🇬 新加坡 (Linode)|http://speedtest.singapore.linode.com/100MB-singapore.bin|100"
-    "US|🇺🇸 美国 (Leaseweb)|http://mirror.leaseweb.com/speedtest/1000mb.bin|1000"
-    "US|🇺🇸 美国 (Hetzner)|https://ash-speed.hetzner.com/1GB.bin|1000"
-    "EU|🇩🇪 德国 (Hetzner)|https://fsn1-speed.hetzner.com/1GB.bin|1000"
-    "EU|🇫🇷 法国 (Scaleway)|http://ping.online.net/1000Mo.dat|1000"
-    "EU|🇳🇱 荷兰 (Tele2)|http://speedtest.tele2.net/1GB.zip|1024"
-    "EU|🇬🇧 英国 (ThinkBroadband)|http://ipv4.download.thinkbroadband.com/1GB.zip|1024"
+    "Global|Leaseweb (Global)|http://mirror.leaseweb.com/speedtest/1000mb.bin|1000"
+    "EU|Hetzner (Germany)|https://fsn1-speed.hetzner.com/1GB.bin|1000"
+    "EU|Hetzner (Finland)|https://hel1-speed.hetzner.com/1GB.bin|1000"
+    "EU|Scaleway (France)|http://ping.online.net/1000Mo.dat|1000"
+    "US|Tele2 (Generic)|http://speedtest.tele2.net/100MB.zip|100"
     "Global|OVH (Global)|http://proof.ovh.net/files/1Gb.dat|1024"
+    "US|Ashburn (US)|http://speedtest.ashburn.linode.com/100MB-ashburn.bin|100"
+    "JP|Tokyo (Linode)|http://speedtest.tokyo2.linode.com/100MB-tokyo2.bin|100"
 )
 
-BEST_URL=""
-BEST_NAME=""
-BEST_SIZE=""
-MODE_SWITCHED=0
-
 # ====================
-# 3. 智能优选 (带超时保护)
+# 3. 核心工具函数
 # ====================
-select_best_node() {
-    echo -e "\n${PURPLE}🔍 正在优选节点 (Smart Select)...${NC}"
-    min_ping=9999
-    best_index=0
-    
-    for i in "${!NODES[@]}"; do
-        node_str="${NODES[$i]}"
-        name=$(echo "$node_str" | cut -d'|' -f2)
-        url=$(echo "$node_str" | cut -d'|' -f3)
-        domain=$(echo "$url" | awk -F/ '{print $3}')
-        
-        # Ping 优化：超时0.5秒，只ping一次
-        ping_val=$(ping -c 1 -W 1 "$domain" | grep 'time=' | awk -F'time=' '{print $2}' | awk '{print $1}' | cut -d. -f1)
-        
-        if [[ -z "$ping_val" ]]; then
-            echo -e "   $name \t -> ${RED}超时${NC}"
-        else
-            echo -e "   $name \t -> ${GREEN}${ping_val} ms${NC}"
-            if [ "$ping_val" -lt "$min_ping" ]; then
-                min_ping=$ping_val
-                best_index=$i
-            fi
-        fi
-    done
 
-    best_node="${NODES[$best_index]}"
-    BEST_NAME=$(echo "$best_node" | cut -d'|' -f2)
-    BEST_URL=$(echo "$best_node" | cut -d'|' -f3)
-    BEST_SIZE=$(echo "$best_node" | cut -d'|' -f4)
-    
-    echo -e "✅ 选中: ${SKYBLUE}$BEST_NAME${NC}"
-    sleep 1
+# 预检文件是否可用 (HTTP 200/301)
+check_url_alive() {
+    url="$1"
+    # 使用 curl -I (Head) 检查，超时 3 秒
+    code=$(curl -o /dev/null --silent --head --write-out '%{http_code}\n' --max-time 3 "$url")
+    if [[ "$code" == "200" ]] || [[ "$code" == "301" ]] || [[ "$code" == "302" ]]; then
+        return 0 # 活着
+    else
+        return 1 # 死了 (403/404/超时)
+    fi
 }
 
-# 随机获取节点 (Fallback)
-get_random_node() {
-    RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
-    node_str="${NODES[$RANDOM_INDEX]}"
-    BEST_NAME="随机: $(echo "$node_str" | cut -d'|' -f2)"
-    BEST_URL=$(echo "$node_str" | cut -d'|' -f3)
-    BEST_SIZE=$(echo "$node_str" | cut -d'|' -f4)
-}
-
-# ====================
-# 4. 仪表盘
-# ====================
 display_status() {
     clear
     TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MB/1024}")
-    
     echo -e "${BLUE}#################################################${NC}"
-    echo -e "${BLUE}#      流量消耗挂机脚本 v7.0 (修复版)           #${NC}"
+    echo -e "${BLUE}#            流量消耗挂机脚本 v8.0              #${NC}"
     echo -e "${BLUE}#################################################${NC}"
-    echo -e "   📍 ${PURPLE}位置:${NC} $MY_COUNTRY - $MY_CITY"
     echo -e "   🚀 ${GREEN}模式:${NC} $1"
-    echo -e "   🔗 ${GREEN}节点:${NC} ${SKYBLUE}$BEST_NAME${NC}"
-    echo -e "   📊 ${YELLOW}总量:${NC} ${RED}${TOTAL_GB} GB${NC}"
-    
-    if [ $FAIL_COUNT -gt 0 ]; then
-        echo -e "   ⚠️ ${RED}连续失败次数: $FAIL_COUNT${NC}"
-    fi
-    
+    echo -e "   🔗 ${GREEN}当前节点:${NC} ${SKYBLUE}$CURRENT_NODE_NAME${NC}"
+    echo -e "   📊 ${YELLOW}已跑流量:${NC} ${RED}${TOTAL_GB} GB${NC}"
+    echo -e "   ⚡ ${YELLOW}速度:${NC} 见下方进度条"
     echo -e "${BLUE}-------------------------------------------------${NC}"
 }
 
 # ====================
-# 5. 执行逻辑
+# 4. 执行逻辑
 # ====================
-run_smart_logic() {
-    # 首次运行先优选
-    select_best_node
-    
+
+run_download() {
     while true; do
-        # 如果连续失败超过2次，切换到随机模式防止死循环
-        if [ $FAIL_COUNT -ge 2 ]; then
-            MODE_SWITCHED=1
-            get_random_node
-            display_status "自动随机 (故障转移)"
-        else
-            if [ $MODE_SWITCHED -eq 0 ]; then
-                display_status "智能优选 (Smart)"
-            else
-                get_random_node
-                display_status "随机轮询 (Random)"
-            fi
-        fi
+        # --- 随机选一个节点 ---
+        RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
+        node_str="${NODES[$RANDOM_INDEX]}"
         
-        echo -e "正在下载: ${SKYBLUE}$BEST_URL${NC}"
+        CURRENT_NODE_NAME=$(echo "$node_str" | cut -d'|' -f2)
+        url=$(echo "$node_str" | cut -d'|' -f3)
+        size=$(echo "$node_str" | cut -d'|' -f4)
+
+        display_status "多线程下载 (自动轮询)"
+
+        echo -e "正在检测节点可用性: ${YELLOW}$CURRENT_NODE_NAME${NC} ..."
         
-        # axel 运行
-        axel -n $THREADS -a -k -o /dev/null "$BEST_URL"
-        
-        # 检查结果
-        if [ $? -eq 0 ]; then
-            TOTAL_MB=$((TOTAL_MB + BEST_SIZE))
-            FAIL_COUNT=0 # 成功则重置失败计数
-        else
-            echo -e "${RED}[!] 下载失败 (HTTP Error/Timeout)${NC}"
-            FAIL_COUNT=$((FAIL_COUNT + 1))
+        # --- 关键修复：先检测，后下载 ---
+        if check_url_alive "$url"; then
+            echo -e "${GREEN}节点正常 (HTTP 200 OK)，开始下载...${NC}"
             
-            if [ $FAIL_COUNT -ge 2 ]; then
-                echo -e "${RED}[!] 检测到优选节点不可用，正在切换到随机备用节点...${NC}"
-                sleep 2
+            # --- 关键修复：删除 axel 残留文件，防止报错 ---
+            rm -f *.st
+            filename=$(basename "$url")
+            rm -f "$filename"
+            
+            # 运行 axel
+            # -n 线程数
+            # -a 简洁进度条
+            # -o /dev/null 直接丢弃
+            axel -n $THREADS -a -k -o /dev/null "$url"
+            
+            exit_code=$?
+            if [ $exit_code -eq 0 ]; then
+                TOTAL_MB=$((TOTAL_MB + size))
+                echo -e "${GREEN}下载完成，流量已记录。${NC}"
             else
-                echo -e "${YELLOW}正在重试...${NC}"
-                sleep 1
+                echo -e "${RED}[!] 下载中途断开，不计入统计。${NC}"
             fi
+        else
+            echo -e "${RED}[!] 节点不可用 (404/403/超时)，跳过...${NC}"
+            sleep 1
         fi
         
-        # 每次下载完稍微休息一下，防止CPU过热
+        # 强制清理垃圾
+        rm -f *.st
         sleep 1
     done
 }
 
 run_both() {
-    select_best_node
     while true; do
-        if [ $FAIL_COUNT -ge 2 ]; then get_random_node; fi
+        # 1. 下载部分
+        RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
+        node_str="${NODES[$RANDOM_INDEX]}"
+        CURRENT_NODE_NAME=$(echo "$node_str" | cut -d'|' -f2)
+        url=$(echo "$node_str" | cut -d'|' -f3)
+        size=$(echo "$node_str" | cut -d'|' -f4)
         
-        display_status "混合模式"
-        echo -e "${SKYBLUE}[1/2] 下载中...${NC}"
-        axel -n $THREADS -a -k -o /dev/null "$BEST_URL"
-        if [ $? -eq 0 ]; then 
-            TOTAL_MB=$((TOTAL_MB + BEST_SIZE))
-            FAIL_COUNT=0 
+        display_status "混合模式 (Down+Up)"
+        
+        if check_url_alive "$url"; then
+            echo -e "${SKYBLUE}[1/2] 正在下载...${NC}"
+            rm -f *.st
+            axel -n $THREADS -a -k -o /dev/null "$url"
+            if [ $? -eq 0 ]; then TOTAL_MB=$((TOTAL_MB + size)); fi
         else
-            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "${RED}[!] 节点失效，跳过下载...${NC}"
         fi
         
-        echo -e "\n${SKYBLUE}[2/2] 上传中...${NC}"
+        # 2. 上传部分
+        echo -e "\n${SKYBLUE}[2/2] 正在上传 (Speedtest)...${NC}"
         speedtest-cli --secure
         TOTAL_MB=$((TOTAL_MB + 50))
+        
+        rm -f *.st
         sleep 2
     done
 }
 
 # ====================
-# 6. 入口
+# 5. 主菜单
 # ====================
 main() {
     clear
     check_dep
-    get_ip_info
+    # 强制清理旧的残留文件
+    rm -f *.st
     
     echo -e "================================================="
-    echo -e "   流量消耗脚本 v7.0 (Smart Failover)"
-    echo -e "   当前位置: ${GREEN}$MY_COUNTRY${NC}"
+    echo -e "   流量消耗脚本 v8.0 (最终修正版)"
     echo -e "================================================="
-    echo -e "1. ${GREEN}智能优选下行${NC} (失败自动切换随机，防卡死)"
-    echo -e "2. ${GREEN}智能混合模式${NC}"
-    echo -e "3. ${GREEN}只跑上行${NC}"
+    echo -e "1. ${GREEN}多线程跑下行${NC} (Axel 8线程 - 推荐)"
+    echo -e "2. ${GREEN}混合跑流量${NC} (下行 + Speedtest上行)"
+    echo -e "3. ${GREEN}只跑上行${NC} (Speedtest)"
     echo -e "0. 退出"
     echo -e "================================================="
     read -p "选择 [1-3]: " choice
 
     case $choice in
-        1) run_smart_logic ;;
+        1) run_download ;;
         2) run_both ;;
         3) 
-           BEST_NAME="Speedtest Upload"
+           CURRENT_NODE_NAME="Speedtest Upload"
            while true; do
                display_status "只跑上行"
                speedtest-cli --no-download --secure

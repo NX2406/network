@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==================================================
-# 流量消耗/测速脚本 v8.0 (死循环终极修复版)
+# 流量消耗/测速脚本 v9.0 (全球CDN/Anycast版)
 # ==================================================
 
 # 颜色定义
@@ -12,176 +12,133 @@ SKYBLUE='\033[0;36m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 线程数 (默认8，过大容易被断开)
+# 线程数 (Axel)
 THREADS=8
 # 累计消耗流量 (MB)
 TOTAL_MB=0
 
-# 捕获 Ctrl+C
+# 捕获 Ctrl+C，强制清理缓存文件
 trap 'echo -e "\n${RED}[!] 脚本已停止。本次运行共消耗流量：$(awk "BEGIN {print $TOTAL_MB/1024}") GB${NC}"; rm -f *.st; exit 1' INT
 
 # ====================
-# 1. 基础依赖检查
+# 1. 依赖检查
 # ====================
 check_dep() {
-    # 检查/安装 axel
     if ! command -v axel &> /dev/null; then
-        echo -e "${YELLOW}正在安装 axel...${NC}"
+        echo -e "${YELLOW}正在安装 axel (多线程下载器)...${NC}"
         if [ -f /etc/debian_version ]; then 
             apt-get update -y -q && apt-get install -y axel
         elif [ -f /etc/redhat-release ]; then
             yum install -y epel-release && yum install -y axel
         fi
     fi
-    # 检查/安装 speedtest
     if ! command -v speedtest-cli &> /dev/null; then
-        echo -e "${YELLOW}正在安装 speedtest-cli...${NC}"
-        pip3 install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null || yum install -y speedtest-cli 2>/dev/null
+        pip3 install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null
     fi
-    # 检查 curl
-    if ! command -v curl &> /dev/null; then apt-get install -y curl; fi
 }
 
 # ====================
-# 2. 高质量节点库 (精简为必活节点)
+# 2. 顶级骨干网节点 (Anycast)
 # ====================
-# 格式: 地区|名称|URL|大小(MB)
-# 只保留大厂官方 Looking Glass，剔除易变节点
+# 这些节点由全球CDN托管，自动路由到最近节点，极少失效
 NODES=(
-    "Global|Leaseweb (Global)|http://mirror.leaseweb.com/speedtest/1000mb.bin|1000"
-    "EU|Hetzner (Germany)|https://fsn1-speed.hetzner.com/1GB.bin|1000"
-    "EU|Hetzner (Finland)|https://hel1-speed.hetzner.com/1GB.bin|1000"
-    "EU|Scaleway (France)|http://ping.online.net/1000Mo.dat|1000"
-    "US|Tele2 (Generic)|http://speedtest.tele2.net/100MB.zip|100"
-    "Global|OVH (Global)|http://proof.ovh.net/files/1Gb.dat|1024"
-    "US|Ashburn (US)|http://speedtest.ashburn.linode.com/100MB-ashburn.bin|100"
-    "JP|Tokyo (Linode)|http://speedtest.tokyo2.linode.com/100MB-tokyo2.bin|100"
+    "CDN77 (Global)|https://test.cdn77.com/1000MB.zip|1000"
+    "Cachefly (Global)|http://cachefly.cachefly.net/100mb.test|100"
+    "Hetzner (Europe)|https://fsn1-speed.hetzner.com/1GB.bin|1000"
+    "Lancom (Global)|https://speedtest.lancom.de/1GB.bin|1000"
 )
-
-# ====================
-# 3. 核心工具函数
-# ====================
-
-# 预检文件是否可用 (HTTP 200/301)
-check_url_alive() {
-    url="$1"
-    # 使用 curl -I (Head) 检查，超时 3 秒
-    code=$(curl -o /dev/null --silent --head --write-out '%{http_code}\n' --max-time 3 "$url")
-    if [[ "$code" == "200" ]] || [[ "$code" == "301" ]] || [[ "$code" == "302" ]]; then
-        return 0 # 活着
-    else
-        return 1 # 死了 (403/404/超时)
-    fi
-}
 
 display_status() {
     clear
     TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MB/1024}")
     echo -e "${BLUE}#################################################${NC}"
-    echo -e "${BLUE}#            流量消耗挂机脚本 v8.0              #${NC}"
+    echo -e "${BLUE}#         流量消耗脚本 v9.0 (CDN 稳定版)        #${NC}"
     echo -e "${BLUE}#################################################${NC}"
-    echo -e "   🚀 ${GREEN}模式:${NC} $1"
-    echo -e "   🔗 ${GREEN}当前节点:${NC} ${SKYBLUE}$CURRENT_NODE_NAME${NC}"
+    echo -e "   🚀 ${GREEN}当前模式:${NC} $1"
+    echo -e "   🔗 ${GREEN}正在连接:${NC} ${SKYBLUE}$CURRENT_NODE_NAME${NC}"
     echo -e "   📊 ${YELLOW}已跑流量:${NC} ${RED}${TOTAL_GB} GB${NC}"
-    echo -e "   ⚡ ${YELLOW}速度:${NC} 见下方进度条"
+    echo -e "   ⚡ ${YELLOW}实时速度:${NC} 请看下方进度条"
     echo -e "${BLUE}-------------------------------------------------${NC}"
 }
 
 # ====================
-# 4. 执行逻辑
+# 3. 核心执行逻辑
 # ====================
-
 run_download() {
     while true; do
-        # --- 随机选一个节点 ---
-        RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
-        node_str="${NODES[$RANDOM_INDEX]}"
-        
-        CURRENT_NODE_NAME=$(echo "$node_str" | cut -d'|' -f2)
-        url=$(echo "$node_str" | cut -d'|' -f3)
-        size=$(echo "$node_str" | cut -d'|' -f4)
+        # 轮询列表中的节点
+        for node in "${NODES[@]}"; do
+            CURRENT_NODE_NAME=$(echo "$node" | cut -d'|' -f1)
+            url=$(echo "$node" | cut -d'|' -f2)
+            size=$(echo "$node" | cut -d'|' -f3)
 
-        display_status "多线程下载 (自动轮询)"
+            display_status "多线程下行 (Global CDN)"
 
-        echo -e "正在检测节点可用性: ${YELLOW}$CURRENT_NODE_NAME${NC} ..."
-        
-        # --- 关键修复：先检测，后下载 ---
-        if check_url_alive "$url"; then
-            echo -e "${GREEN}节点正常 (HTTP 200 OK)，开始下载...${NC}"
-            
-            # --- 关键修复：删除 axel 残留文件，防止报错 ---
+            # 清理旧缓存，防止 No state file 报错
             rm -f *.st
-            filename=$(basename "$url")
-            rm -f "$filename"
             
-            # 运行 axel
-            # -n 线程数
-            # -a 简洁进度条
-            # -o /dev/null 直接丢弃
-            axel -n $THREADS -a -k -o /dev/null "$url"
+            # --- 核心修改：伪装 User-Agent ---
+            # -H: 添加 Header
+            # -n: 线程数
+            # -k: 不检查证书 (防止老旧系统证书报错)
+            # -o: 输出到空设备
+            # --timeout: 10秒超时
+            axel -n $THREADS -a -k -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o /dev/null --timeout=10 "$url"
             
             exit_code=$?
+            
+            # 只有成功(0)才计入流量
             if [ $exit_code -eq 0 ]; then
                 TOTAL_MB=$((TOTAL_MB + size))
-                echo -e "${GREEN}下载完成，流量已记录。${NC}"
+                echo -e "${GREEN} >> 下载完成，准备下一轮...${NC}"
+                sleep 1
             else
-                echo -e "${RED}[!] 下载中途断开，不计入统计。${NC}"
+                # 失败处理
+                echo -e "${RED} >> 当前节点连接中断或超时，自动切换下一个...${NC}"
+                sleep 1
             fi
-        else
-            echo -e "${RED}[!] 节点不可用 (404/403/超时)，跳过...${NC}"
-            sleep 1
-        fi
-        
-        # 强制清理垃圾
-        rm -f *.st
-        sleep 1
+            
+            # 再次强制清理
+            rm -f *.st
+        done
     done
 }
 
 run_both() {
     while true; do
-        # 1. 下载部分
-        RANDOM_INDEX=$((RANDOM % ${#NODES[@]}))
-        node_str="${NODES[$RANDOM_INDEX]}"
-        CURRENT_NODE_NAME=$(echo "$node_str" | cut -d'|' -f2)
-        url=$(echo "$node_str" | cut -d'|' -f3)
-        size=$(echo "$node_str" | cut -d'|' -f4)
+        # 下行部分 (只跑列表第一个，通常是最快的 CDN77)
+        node="${NODES[0]}" 
+        CURRENT_NODE_NAME=$(echo "$node" | cut -d'|' -f1)
+        url=$(echo "$node" | cut -d'|' -f2)
+        size=$(echo "$node" | cut -d'|' -f3)
         
         display_status "混合模式 (Down+Up)"
         
-        if check_url_alive "$url"; then
-            echo -e "${SKYBLUE}[1/2] 正在下载...${NC}"
-            rm -f *.st
-            axel -n $THREADS -a -k -o /dev/null "$url"
-            if [ $? -eq 0 ]; then TOTAL_MB=$((TOTAL_MB + size)); fi
-        else
-            echo -e "${RED}[!] 节点失效，跳过下载...${NC}"
-        fi
+        rm -f *.st
+        axel -n $THREADS -a -k -H "User-Agent: Mozilla/5.0" -o /dev/null --timeout=10 "$url"
+        if [ $? -eq 0 ]; then TOTAL_MB=$((TOTAL_MB + size)); fi
+        rm -f *.st
         
-        # 2. 上传部分
         echo -e "\n${SKYBLUE}[2/2] 正在上传 (Speedtest)...${NC}"
         speedtest-cli --secure
         TOTAL_MB=$((TOTAL_MB + 50))
-        
-        rm -f *.st
         sleep 2
     done
 }
 
 # ====================
-# 5. 主菜单
+# 4. 菜单
 # ====================
 main() {
     clear
     check_dep
-    # 强制清理旧的残留文件
-    rm -f *.st
+    rm -f *.st # 启动前清理残渣
     
     echo -e "================================================="
-    echo -e "   流量消耗脚本 v8.0 (最终修正版)"
+    echo -e "   流量消耗脚本 v9.0 (Global CDN Edition)"
     echo -e "================================================="
-    echo -e "1. ${GREEN}多线程跑下行${NC} (Axel 8线程 - 推荐)"
-    echo -e "2. ${GREEN}混合跑流量${NC} (下行 + Speedtest上行)"
+    echo -e "1. ${GREEN}多线程跑下行${NC} (推荐! 使用全球 CDN 骨干网)"
+    echo -e "2. ${GREEN}混合跑流量${NC} (下行 + 上行)"
     echo -e "3. ${GREEN}只跑上行${NC} (Speedtest)"
     echo -e "0. 退出"
     echo -e "================================================="

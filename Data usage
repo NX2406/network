@@ -1,110 +1,134 @@
 #!/bin/bash
 
-# ==========================================
-# 流量消耗/循环测速脚本 - One Click Version
-# ==========================================
+# ==================================================
+# 流量消耗/循环测速脚本 v3.0 (仪表盘版)
+# ==================================================
 
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+SKYBLUE='\033[0;36m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 检查是否以 Root 运行
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}错误：请使用 sudo 或 root 用户运行此脚本！${NC}" 
-   exit 1
-fi
+# 累计消耗流量变量 (单位: MB)
+TOTAL_MB=0
 
 # 捕获 Ctrl+C
-trap 'echo -e "\n${RED}[!] 用户终止脚本。${NC}"; exit 1' INT
+trap 'echo -e "\n${RED}[!] 脚本已停止。本次运行共消耗流量：$(awk "BEGIN {print $TOTAL_MB/1024}") GB${NC}"; exit 1' INT
 
-# 自动安装依赖函数
-install_dependencies() {
-    echo -e "${BLUE}[*] 正在检查并安装必要组件 (wget, speedtest-cli, python3)...${NC}"
-    
-    # 检测系统包管理器
-    if [ -f /etc/debian_version ]; then
-        PM="apt-get"
-        $PM update -y -q
-        $PM install -y -q wget python3 python3-pip
-    elif [ -f /etc/redhat-release ]; then
-        PM="yum"
-        $PM install -y -q wget python3 python3-pip
-    else
-        echo -e "${RED}[!] 不支持的系统，请手动安装 wget 和 speedtest-cli${NC}"
-        exit 1
+# 依赖检查
+check_dep() {
+    if ! command -v wget &> /dev/null; then
+        echo -e "${YELLOW}正在安装 wget...${NC}"
+        if [ -f /etc/debian_version ]; then apt-get install -y wget; 
+        elif [ -f /etc/redhat-release ]; then yum install -y wget; fi
     fi
-
-    # 安装 speedtest-cli (优先使用 pip，版本更新)
     if ! command -v speedtest-cli &> /dev/null; then
-        echo -e "${YELLOW}[-] 正在通过 pip 安装 speedtest-cli...${NC}"
-        pip3 install speedtest-cli
+        echo -e "${YELLOW}正在安装 speedtest-cli...${NC}"
+        pip3 install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null || yum install -y speedtest-cli 2>/dev/null
     fi
-    echo -e "${GREEN}[+] 环境准备就绪。${NC}"
 }
 
-# 1. 跑路下行 (消耗最快)
+# 格式化显示流量 (MB -> GB)
+display_status() {
+    clear
+    # 计算 GB
+    TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MB/1024}")
+    
+    echo -e "${BLUE}#################################################${NC}"
+    echo -e "${BLUE}#            流量消耗挂机脚本 v3.0              #${NC}"
+    echo -e "${BLUE}#################################################${NC}"
+    echo -e ""
+    echo -e "   🚀 ${GREEN}当前模式:${NC} $1"
+    echo -e "   📊 ${YELLOW}已消耗总流量:${NC} ${RED}${TOTAL_GB} GB${NC}"
+    echo -e "   ⏱️  ${SKYBLUE}运行状态:${NC} 正在运行中 (按 Ctrl+C 停止)"
+    echo -e ""
+    echo -e "${BLUE}-------------------------------------------------${NC}"
+    echo -e "正在执行下一轮任务..."
+}
+
+# 1. 如下行 (循环下载)
 run_download() {
-    echo -e "${GREEN}=== 模式：无限下行 (Wget -> /dev/null) ===${NC}"
-    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
-    count=1
+    # 使用 512MB 的文件，既能跑满带宽，又能比较快地刷新“已消耗流量”的统计
+    # 备选源列表
+    URL1="http://speedtest.tele2.net/512MB.zip"
+    URL2="http://ping.online.net/500Mo.dat"
+    
+    SIZE_MB=512
+    
     while true; do
-        echo -e "\n${BLUE}---> 第 $count 次下载...${NC}"
-        # 这里的链接选择了 Cloudflare 全球 CDN，速度通常很快
-        wget -O /dev/null "https://speed.cloudflare.com/__down?bytes=1000000000" --report-speed=bits
-        ((count++))
+        display_status "只跑下行 (Download)"
+        
+        # 尝试使用 URL1
+        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "$URL1"
+        if [ $? -eq 0 ]; then
+            TOTAL_MB=$((TOTAL_MB + SIZE_MB))
+        else
+            echo -e "${RED}[!] 节点1连接失败，切换备用节点...${NC}"
+            wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "$URL2"
+            if [ $? -eq 0 ]; then
+                TOTAL_MB=$((TOTAL_MB + 500))
+            else
+                echo -e "${RED}[!] 所有节点均超时，等待 5 秒重试...${NC}"
+                sleep 5
+            fi
+        fi
     done
 }
 
-# 2. 跑路上行
+# 2. 跑上行 (Speedtest Upload)
 run_upload() {
-    echo -e "${GREEN}=== 模式：无限上行 (Speedtest Upload Only) ===${NC}"
-    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
-    count=1
     while true; do
-        echo -e "\n${BLUE}---> 第 $count 次上传...${NC}"
+        display_status "只跑上行 (Upload)"
+        echo -e "${YELLOW}正在测速上传 (不下载)...${NC}"
+        # speedtest 比较难精确统计流量，按一次大概 50-100MB 估算，或者只显示次数
         speedtest-cli --no-download --secure
-        ((count++))
-        sleep 1
+        echo -e "\n${GREEN}完成一轮上传，休息 2 秒...${NC}"
+        sleep 2
+        # 简单估算增加统计 (仅作参考)
+        TOTAL_MB=$((TOTAL_MB + 50)) 
     done
 }
 
-# 3. 双向消耗
+# 3. 混合模式
 run_both() {
-    echo -e "${GREEN}=== 模式：双向循环 ===${NC}"
-    echo -e "${YELLOW}提示：按 Ctrl+C 停止${NC}"
-    count=1
     while true; do
-        echo -e "\n${BLUE}---> 第 $count 次双向测试...${NC}"
+        display_status "混合双打 (Down+Up)"
+        
+        echo -e "${SKYBLUE}[1/2] 正在下载...${NC}"
+        wget -O /dev/null --user-agent="Mozilla/5.0" --show-progress "http://speedtest.tele2.net/100MB.zip"
+        TOTAL_MB=$((TOTAL_MB + 100))
+        
+        echo -e "\n${SKYBLUE}[2/2] 正在上传...${NC}"
         speedtest-cli --secure
-        ((count++))
-        sleep 1
+        TOTAL_MB=$((TOTAL_MB + 50))
+        
+        sleep 2
     done
 }
 
 # 菜单
-main_menu() {
+main() {
+    check_dep
     clear
-    install_dependencies
-    echo -e "======================================"
-    echo -e "    ${YELLOW}流量消耗一键脚本 v2.0${NC}"
-    echo -e "======================================"
-    echo -e "1. ${GREEN}只跑下行${NC} (最高效，不占硬盘)"
-    echo -e "2. ${GREEN}只跑上行${NC} (模拟上传)"
-    echo -e "3. ${GREEN}混合双打${NC} (先下后上)"
+    echo -e "=================================="
+    echo -e "   流量消耗脚本 (带统计面板)"
+    echo -e "=================================="
+    echo -e "1. ${GREEN}只跑下行${NC} (推荐，显示进度条)"
+    echo -e "2. ${GREEN}只跑上行${NC} (使用 Speedtest)"
+    echo -e "3. ${GREEN}混合循环${NC}"
     echo -e "0. 退出"
-    echo -e "======================================"
-    read -p "请输入选项 [1-3]: " choice
+    read -p "请选择: " choice
 
     case $choice in
         1) run_download ;;
         2) run_upload ;;
         3) run_both ;;
         0) exit 0 ;;
-        *) echo "无效输入"; sleep 1; main_menu ;;
+        *) main ;;
     esac
 }
 
-main_menu
+main

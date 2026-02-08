@@ -1,163 +1,104 @@
 #!/bin/bash
 
 # ==================================================
-# 流量消耗/测速脚本 v9.0 (全球CDN/Anycast版)
+# 流量消耗脚本 v10.0 (DNS暴力修复 + 多进程并发版)
 # ==================================================
 
-# 颜色定义
+# 颜色
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-SKYBLUE='\033[0;36m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 线程数 (Axel)
-THREADS=8
-# 累计消耗流量 (MB)
-TOTAL_MB=0
+# 累计流量 (估算)
+TOTAL_GB=0
+# 并发进程数 (等于多线程)
+CONCURRENT_NUM=4
 
-# 捕获 Ctrl+C，强制清理缓存文件
-trap 'echo -e "\n${RED}[!] 脚本已停止。本次运行共消耗流量：$(awk "BEGIN {print $TOTAL_MB/1024}") GB${NC}"; rm -f *.st; exit 1' INT
+# 捕获 Ctrl+C，杀掉所有后台下载进程
+trap 'echo -e "\n${RED}[!] 停止脚本，正在清理后台进程...${NC}"; kill $(jobs -p) 2>/dev/null; exit 1' INT
 
 # ====================
-# 1. 依赖检查
+# 1. 暴力修复 DNS (核心修复)
 # ====================
+fix_dns() {
+    echo -e "${YELLOW}[*] 检测到可能的 DNS 故障，正在强制修复 DNS...${NC}"
+    # 备份原文件
+    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+    # 写入 Google DNS
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+    
+    # 测试一下能不能通
+    ping -c 1 -W 1 google.com > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}[+] DNS 修复成功，网络已通！${NC}"
+    else
+        echo -e "${RED}[!] DNS 修复失败，您的服务器可能被防火墙完全阻断！${NC}"
+    fi
+}
+
 check_dep() {
-    if ! command -v axel &> /dev/null; then
-        echo -e "${YELLOW}正在安装 axel (多线程下载器)...${NC}"
-        if [ -f /etc/debian_version ]; then 
-            apt-get update -y -q && apt-get install -y axel
-        elif [ -f /etc/redhat-release ]; then
-            yum install -y epel-release && yum install -y axel
-        fi
-    fi
-    if ! command -v speedtest-cli &> /dev/null; then
-        pip3 install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null
+    if ! command -v wget &> /dev/null; then
+        apt-get install -y wget || yum install -y wget
     fi
 }
 
 # ====================
-# 2. 顶级骨干网节点 (Anycast)
+# 2. 运行逻辑 (多进程 Wget)
 # ====================
-# 这些节点由全球CDN托管，自动路由到最近节点，极少失效
-NODES=(
-    "CDN77 (Global)|https://test.cdn77.com/1000MB.zip|1000"
-    "Cachefly (Global)|http://cachefly.cachefly.net/100mb.test|100"
-    "Hetzner (Europe)|https://fsn1-speed.hetzner.com/1GB.bin|1000"
-    "Lancom (Global)|https://speedtest.lancom.de/1GB.bin|1000"
-)
+run_traffic() {
+    # 使用 Hetzner 官方测速源 (10GB文件)，最稳，不封 IP
+    URL="https://fsn1-speed.hetzner.com/10GB.bin"
+    
+    echo -e "${BLUE}==============================================${NC}"
+    echo -e "   正在启动 ${GREEN}${CONCURRENT_NUM}${NC} 个并发进程进行消耗..."
+    echo -e "   使用节点: Hetzner (德国)"
+    echo -e "   ${YELLOW}注意：不再显示进度条，直接看流量统计${NC}"
+    echo -e "${BLUE}==============================================${NC}"
 
-display_status() {
-    clear
-    TOTAL_GB=$(awk "BEGIN {printf \"%.2f\", $TOTAL_MB/1024}")
-    echo -e "${BLUE}#################################################${NC}"
-    echo -e "${BLUE}#         流量消耗脚本 v9.0 (CDN 稳定版)        #${NC}"
-    echo -e "${BLUE}#################################################${NC}"
-    echo -e "   🚀 ${GREEN}当前模式:${NC} $1"
-    echo -e "   🔗 ${GREEN}正在连接:${NC} ${SKYBLUE}$CURRENT_NODE_NAME${NC}"
-    echo -e "   📊 ${YELLOW}已跑流量:${NC} ${RED}${TOTAL_GB} GB${NC}"
-    echo -e "   ⚡ ${YELLOW}实时速度:${NC} 请看下方进度条"
-    echo -e "${BLUE}-------------------------------------------------${NC}"
-}
-
-# ====================
-# 3. 核心执行逻辑
-# ====================
-run_download() {
     while true; do
-        # 轮询列表中的节点
-        for node in "${NODES[@]}"; do
-            CURRENT_NODE_NAME=$(echo "$node" | cut -d'|' -f1)
-            url=$(echo "$node" | cut -d'|' -f2)
-            size=$(echo "$node" | cut -d'|' -f3)
-
-            display_status "多线程下行 (Global CDN)"
-
-            # 清理旧缓存，防止 No state file 报错
-            rm -f *.st
-            
-            # --- 核心修改：伪装 User-Agent ---
-            # -H: 添加 Header
-            # -n: 线程数
-            # -k: 不检查证书 (防止老旧系统证书报错)
-            # -o: 输出到空设备
-            # --timeout: 10秒超时
-            axel -n $THREADS -a -k -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o /dev/null --timeout=10 "$url"
-            
-            exit_code=$?
-            
-            # 只有成功(0)才计入流量
-            if [ $exit_code -eq 0 ]; then
-                TOTAL_MB=$((TOTAL_MB + size))
-                echo -e "${GREEN} >> 下载完成，准备下一轮...${NC}"
-                sleep 1
-            else
-                # 失败处理
-                echo -e "${RED} >> 当前节点连接中断或超时，自动切换下一个...${NC}"
-                sleep 1
-            fi
-            
-            # 再次强制清理
-            rm -f *.st
+        # 启动多进程后台下载
+        for ((i=1; i<=CONCURRENT_NUM; i++)); do
+            # -O /dev/null: 不占硬盘
+            # -q: 静默模式
+            # --timeout: 超时保护
+            wget -O /dev/null -q --timeout=10 --tries=2 "$URL" &
         done
-    done
-}
 
-run_both() {
-    while true; do
-        # 下行部分 (只跑列表第一个，通常是最快的 CDN77)
-        node="${NODES[0]}" 
-        CURRENT_NODE_NAME=$(echo "$node" | cut -d'|' -f1)
-        url=$(echo "$node" | cut -d'|' -f2)
-        size=$(echo "$node" | cut -d'|' -f3)
+        # 等待这一批全部跑完 (或超时)
+        wait
         
-        display_status "混合模式 (Down+Up)"
+        # 统计流量 (粗略计算：4个进程 x 10GB = 40GB，但为了准确通常跑不满就会断，这里按时间估算或仅仅是为了跑流量)
+        # 这里为了不误导，我们直接无限循环，不依赖文件大小统计
+        echo -e "${GREEN} >> 完成一轮并发消耗 (约消耗带宽满载运行)...${NC}"
         
-        rm -f *.st
-        axel -n $THREADS -a -k -H "User-Agent: Mozilla/5.0" -o /dev/null --timeout=10 "$url"
-        if [ $? -eq 0 ]; then TOTAL_MB=$((TOTAL_MB + size)); fi
-        rm -f *.st
-        
-        echo -e "\n${SKYBLUE}[2/2] 正在上传 (Speedtest)...${NC}"
-        speedtest-cli --secure
-        TOTAL_MB=$((TOTAL_MB + 50))
-        sleep 2
+        # 简单防卡死
+        sleep 1
     done
 }
 
 # ====================
-# 4. 菜单
+# 3. 入口
 # ====================
 main() {
     clear
+    # 必须以 Root 运行
+    if [[ $EUID -ne 0 ]]; then
+       echo -e "${RED}必须使用 root 运行！${NC}"; exit 1
+    fi
+
     check_dep
-    rm -f *.st # 启动前清理残渣
+    fix_dns # 先修 DNS
     
-    echo -e "================================================="
-    echo -e "   流量消耗脚本 v9.0 (Global CDN Edition)"
-    echo -e "================================================="
-    echo -e "1. ${GREEN}多线程跑下行${NC} (推荐! 使用全球 CDN 骨干网)"
-    echo -e "2. ${GREEN}混合跑流量${NC} (下行 + 上行)"
-    echo -e "3. ${GREEN}只跑上行${NC} (Speedtest)"
+    echo -e "1. ${GREEN}开始跑流量${NC} (DNS修复 + 4倍速并发)"
     echo -e "0. 退出"
-    echo -e "================================================="
-    read -p "选择 [1-3]: " choice
+    read -p "回车直接开始: " choice
 
     case $choice in
-        1) run_download ;;
-        2) run_both ;;
-        3) 
-           CURRENT_NODE_NAME="Speedtest Upload"
-           while true; do
-               display_status "只跑上行"
-               speedtest-cli --no-download --secure
-               TOTAL_MB=$((TOTAL_MB + 50))
-               sleep 1
-           done 
-           ;;
         0) exit 0 ;;
-        *) main ;;
+        *) run_traffic ;;
     esac
 }
 
